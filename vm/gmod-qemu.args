@@ -1,0 +1,38 @@
+# QEMU system arguments for the GMod x86-64 Linux guest, iOS/UTM (TCG).
+#
+# This is the concrete configuration the architecture describes. In UTM it maps
+# to a VM config; as raw qemu-system-x86_64 args it is what UTM ends up invoking.
+# Tuned for a game guest: TCG multi-thread, generous translation cache, virgl.
+#
+# NOT a launch script — iOS has no shell. It documents the exact machine so the
+# UTM .utm bundle in vm/gmod.utm/ can be regenerated and reviewed in text.
+
+-machine q35,accel=tcg
+-accel tcg,thread=multi,tb-size=1024      # 1 GiB translation cache; games are code-heavy
+-cpu qemu64,+sse,+sse2,+sse3,+ssse3,+sse4.1,+sse4.2,+popcnt   # Source needs SSE; expose a broad SSE set
+-smp 4
+-m 4096
+
+# --- GPU: virtio-gpu with 3D (virgl). Host side renders via ANGLE->Metal. ---
+-device virtio-gpu-gl-pci                  # -gl = virgl 3D; plain virtio-gpu-pci is software fallback
+-display none                             # UTM owns the surface; no SDL/GTK on iOS
+
+# --- input / integration ---
+-device virtio-keyboard-pci
+-device virtio-tablet-pci                 # absolute pointer maps cleanly to touch/trackpad
+-device virtio-net-pci,netdev=n0
+-netdev user,id=n0
+
+# --- storage: the provisioned guest image (see scripts/build-guest-image.sh) ---
+-drive if=virtio,file=gmod-guest.qcow2,format=qcow2,cache=writeback,discard=unmap
+
+# --- guest<->host file share for pushing the game/addons without rebuilding the image ---
+-device virtio-9p-pci,fsdev=share,mount_tag=hostshare
+-fsdev local,id=share,path=share,security_model=mapped-xattr
+
+# Notes:
+# * The guest MUST have Mesa's virgl driver (mesa-utils / libgl1-mesa-dri with
+#   virtio_gpu) or GL falls back to llvmpipe software rendering -> unplayable.
+#   Verify inside the guest with: glxinfo | grep -i "renderer"  -> "virgl"
+# * GMod's Linux client uses OpenGL; that is the path virgl accelerates.
+# * tb-size and -m are the two knobs to trade RAM for fewer translation stalls.

@@ -3,25 +3,27 @@
 <plist version="1.0">
 <dict>
 	<!--
-	  Entitlements for the TrollStore-installed .tipa.
+	  TrollStore entitlements for the UTM-based host app.
 
-	  dynamic-codesigning is the one that matters: it grants persistent JIT
-	  (MAP_JIT + pthread_jit_write_protect_np W^X toggling) so box64's dynarec
-	  can write and run translated arm64 code. TrollStore signs with these
-	  intact; a normal App Store / sideload signature cannot carry it.
+	  Mirrors UTM's own Platform/iOS/iOS.entitlements (extended-virtual-
+	  addressing + increased-memory-limit, needed for the VM's large address
+	  space and RAM), plus dynamic-codesigning.
 
-	  See ARCHITECTURE.md section 1.
+	  dynamic-codesigning is what makes QEMU's TCG take the fast W^X JIT path
+	  instead of split-wx mirror mapping. In UTM's config that is the
+	  hasJitEntitlements branch:
+	      UTMQemuConfiguration+Arguments.swift:553  (see ARCHITECTURE.md)
+	  TrollStore signs with it intact; a normal sideload cannot.
 	-->
 	<key>dynamic-codesigning</key>
 	<true/>
 
-	<key>get-task-allow</key>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
 	<true/>
-
-	<!-- Large address space for the emulated guest + translation cache. -->
 	<key>com.apple.developer.kernel.increased-memory-limit</key>
 	<true/>
-	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+
+	<key>get-task-allow</key>
 	<true/>
 </dict>
 </plist>

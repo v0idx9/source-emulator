@@ -1,100 +1,86 @@
 # Architecture
 
-## What "emulate the engine" actually means
+## Decision: full-system VM (UTM/QEMU), not userspace HLE (box64)
 
-There is no single "Source emulator" to write. Running stock x86-64 game
-binaries on an arm64 iOS device requires four independent layers, each a real
-project, stacked on top of each other:
+Two ways to run x86-64 Linux GMod on arm64 iOS were evaluated:
+
+| | box64 (userspace HLE) | **UTM / QEMU-system (chosen)** |
+|---|---|---|
+| What runs | just the game process | a whole Linux VM, game inside it |
+| Linux syscalls | **must be re-implemented on Darwin** (364 of them — see PORTING-box64.md) | handled by the **guest Linux kernel** inside the VM — nothing to port |
+| iOS JIT | you build the W^X path yourself | **already solved by UTM** (`split-wx`/entitlement) |
+| CPU cost | lower (HLE) | higher (full-system TCG) |
+| GPU | you build GL→Metal yourself | **virtio-gpu + virgl + ANGLE→Metal, already in UTM** |
+| Net | one project-killing blocker (syscalls) | no project-killing blocker; risk is *performance* |
+
+box64 was rejected because its syscall layer is a passthrough to a **Linux host
+kernel** (`x64syscall.c:444-450`) — on Darwin that becomes a Darling/WSL1-class
+rewrite. Full-system emulation sidesteps it completely: the guest *is* Linux, so
+Linux syscalls are serviced by the guest kernel, not translated to Darwin.
+
+`PORTING-box64.md` is kept as the record of *why* HLE was rejected.
+
+## The stack (UTM/QEMU path)
 
 ```
   ┌─────────────────────────────────────────────────────────┐
-  │  GMod x86-64 game binaries (unmodified ELF)              │  <- the goal
+  │  GMod (x86-64 Linux build) — unmodified                 │
   ├─────────────────────────────────────────────────────────┤
-  │  4. Graphics translation   OpenGL  ->  Metal            │
+  │  Guest: real x86-64 Linux kernel + Mesa (virgl driver)  │  <- services its
+  ├─────────────────────────────────────────────────────────┤     own syscalls
+  │  QEMU system, -accel tcg  (x86-64 translated to arm64)  │
   ├─────────────────────────────────────────────────────────┤
-  │  3. Linux userspace shim   ELF loader + libc + syscalls │
+  │  UTM: JIT (split-wx / dynamic-codesigning) + virglrenderer│
   ├─────────────────────────────────────────────────────────┤
-  │  2. x86-64 -> arm64 JIT    box64                        │
-  ├─────────────────────────────────────────────────────────┤
-  │  1. iOS host app           JIT entitlement, W^X, mmap   │
+  │  iOS host: Metal (via ANGLE), TrollStore entitlements   │
   └─────────────────────────────────────────────────────────┘
 ```
 
-You do not get to skip any layer. GMod calls `glXSwapBuffers`, `dlopen`,
-`mmap`, `futex`, `pthread_create`; the binary is an ELF that must be loaded and
-relocated; every instruction is x86-64 that the CPU can't run natively.
+### JIT — solved by UTM (evidence)
 
-## Why *full* emulation, not partial
+`Configuration/UTMQemuConfiguration+Arguments.swift:553-554`:
 
-Decided deliberately — see the conversation that spawned this repo. Short
-version:
+```swift
+// use mirror mapping when we don't have JIT entitlements
+if !UTMCapabilities.current.contains(.hasJitEntitlements) {
+    "split-wx=on"
+```
 
-- Source modules (`engine`, `client`, `server`, `materialsystem`, `vphysics`)
-  connect through `CreateInterface`, which hands out **C++ objects with
-  vtables**. The factory lookup happens once at load; the **vtable method calls
-  happen thousands of times per frame** for the whole session.
-- A *partial* scheme (native arm64 for some modules, emulated x86-64 for others)
-  must place a **mode-switch thunk** on every one of those cross-module calls:
-  save arm64 state, translate the calling convention, enter the JIT, return,
-  unwind. That thunk cannot be cached or inlined away.
-- Because Source's inter-module boundaries are *hot* (render, trace, physics,
-  entity think all cross them per frame), the thunk flood makes partial
-  emulation **slower** than keeping everything in one translation domain.
+With TrollStore's `dynamic-codesigning` entitlement, `hasJitEntitlements` is
+true and QEMU's TCG writes/executes translated code directly. Without it, UTM
+falls back to a split write/execute mirror mapping. `Services/UTMJailbreak.m`
+handles the non-TrollStore `CS_DEBUGGED` detection. Either way, **we do not
+write the iOS JIT layer** — UTM already did.
 
-So: emulate everything, cross no live C++ boundary between native and emulated
-code. Uniform ~2×-and-worse CPU tax, but zero per-call mode switches.
+### Why TCG, not HVF (evidence)
 
-## The layers in detail
+`…+Arguments.swift:532-546`: HVF (`-accel hvf`) is only emitted when
+`isHypervisorUsed`, i.e. guest architecture matches host. An x86-64 guest on an
+arm64 device never matches, so it is forced to `-accel tcg` with a `tb-size`
+translation cache. This is full dynamic translation — the source of the CPU
+cost.
 
-### 1. iOS host app — the JIT problem
+### Graphics — virgl → ANGLE → Metal (evidence)
 
-box64 is a JIT: it writes arm64 code into memory at runtime and executes it.
-iOS forbids `mmap(PROT_EXEC | PROT_WRITE)` for normal apps.
+`…+Arguments.swift:355-362` selects `qemuRendererBackendAngleMetal`, and `:92`
+notes virglrenderer shmem. Path: guest **Mesa virgl** GL driver → `virtio-gpu`
+→ host `virglrenderer` → ANGLE → Metal. This is real 3D acceleration, not
+llvmpipe software rendering. GMod-on-Linux renders with OpenGL, which is exactly
+what the virgl guest driver accelerates.
 
-**This project targets TrollStore installation, which solves it.** A `.tipa`
-installed via TrollStore is signed with real entitlements, including
-`dynamic-codesigning`. That grants persistent JIT: `MAP_JIT` regions plus
-`pthread_jit_write_protect_np()` W^X toggling, the same mechanism browser JS
-engines use — but permanent and not dependent on a debugger being attached.
+## The remaining risk is performance, and it is real
 
-This is the difference between "maybe impossible" and "solved":
+This path has **no impossible blocker** — every layer exists and ships in UTM
+today. What is unproven is whether a **real-time 3D game** is playable through:
 
-- **With TrollStore (our target):** `dynamic-codesigning` in the entitlements
-  plist → box64's dynarec writes and executes translated arm64 code normally.
-  See `packaging/entitlements.plist`.
-- Non-TrollStore fallbacks (AltStore JIT-on-launch, the `CS_DEBUGGED`
-  debugger-attach trick) exist but are fragile and iOS-version-dependent. We do
-  not target them.
+- full-system **x86-64 TCG** (CPU translated, no hardware virt), plus
+- **virgl** GL command translation across the VM boundary to ANGLE/Metal.
 
-Because TrollStore retires the JIT risk, the interpreter-only collapse
-(10-40× slower) is off the table for the target device. The remaining Stage-1
-risk is purely box64's Darwin/iOS port, not the JIT grant.
+TCG is heavier than box64's HLE, and virgl adds per-call marshalling. Emulated
+*desktop* Linux in UTM is usable; a shooter is a much higher bar. The honest
+expectation is "boots and renders, framerate TBD, quite possibly low." That is a
+performance question to measure (ROADMAP Stage 4-5), not a viability wall — which
+is the crucial difference from the box64 path.
 
-### 2. box64 — x86-64 → arm64
-
-Upstream box64 targets arm64 **Linux**. It is not built for Darwin/iOS. Known
-gaps to close: Mach-O host packaging instead of ELF host, Darwin `mmap`/thread
-primitives, signal handling, and the JIT write path above. box64 already has an
-Android arm64 port, which is the closest precedent and the reference to follow.
-
-### 3. Linux userspace shim
-
-The GMod ELF bins are dynamically linked against a Linux libc and call Linux
-syscalls. box64 intercepts x86-64 Linux syscalls and can forward many to the
-host — but the host here is Darwin, whose syscall ABI and semantics differ
-(`futex`, `epoll`, `/proc`, `clone` flags). This shim is the least-charted part
-of the stack on iOS.
-
-### 4. Graphics translation
-
-GMod-on-Linux renders with OpenGL. iOS has no OpenGL driver we can rely on
-long-term (deprecated) and no Vulkan. The realistic sink is **Metal**, reached
-via GL→Metal (ANGLE's Metal backend, or MoltenGL). This is the same GL→Metal
-concern the native port also has, so work here can be shared with that tree.
-
-## Honest cost statement
-
-"~2×" is the CPU-only, steady-state, well-behaved-code figure for a good JIT.
-Real emulated game frames pay more: graphics translation, syscall forwarding,
-translation-cache misses on cold code, and iOS's constrained JIT. Budget for
-"noticeably worse than 2×," not "2× and done."
+If the framerate proves unplayable, the fallback remains the **native arm64
+source port**, which has neither emulation nor virgl overhead.
