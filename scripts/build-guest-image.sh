@@ -30,7 +30,7 @@ echo "==> base rootfs (${SUITE}, x86-64)"
 # linux-image-amd64 gives a bootable kernel+initrd; without it QEMU has nothing
 # to boot. mesa virgl driver is libgl1-mesa-dri (provides virtio_gpu/virgl DRI).
 sudo debootstrap --arch=amd64 --variant=minbase \
-	--include=linux-image-amd64,systemd-sysv,ca-certificates,curl,libgl1-mesa-dri,mesa-utils,libc6-i386,lib32gcc-s1,xserver-xorg-core,xinit,openbox \
+	--include=linux-image-amd64,systemd-sysv,ca-certificates,curl,libgl1-mesa-dri,mesa-utils,libc6-i386,lib32gcc-s1,xserver-xorg-core,xinit,openbox,grub-pc-bin,grub-common \
 	"${SUITE}" "${WORK}/rootfs" http://deb.debian.org/debian
 
 # Root password + serial console so the image is loginable and CI can watch boot.
@@ -82,26 +82,64 @@ GUEST
 sudo chmod +x "${WORK}/rootfs/usr/local/sbin/provision.sh"
 sudo chroot "${WORK}/rootfs" /usr/local/sbin/provision.sh
 
-echo "==> extract kernel + initrd for direct (-kernel/-initrd) boot"
+echo "==> extract kernel + initrd (kept as a fallback -kernel boot path)"
 sudo cp "${WORK}"/rootfs/boot/vmlinuz-* "${ROOT}/vm/vmlinuz"
 sudo cp "${WORK}"/rootfs/boot/initrd.img-* "${ROOT}/vm/initrd.img"
 sudo chown "${SUDO_UID:-$(id -u)}:${SUDO_GID:-$(id -g)}" "${ROOT}/vm/vmlinuz" "${ROOT}/vm/initrd.img"
 
-echo "==> pack rootfs into a qcow2"
-# Single ext4 rootfs; booted via -kernel/-initrd with root=/dev/vda (no bootloader
-# needed). A partitioned self-booting image is a later refinement.
+echo "==> build a SELF-BOOTING partitioned disk (GRUB + baked-in kernel cmdline)"
+# UTM's "Additional Arguments" field splits every entry on whitespace, so a
+# multi-word -append can't be passed through it. The fix: make the disk boot
+# itself. We install BIOS GRUB into the MBR and bake the kernel command line
+# (root=, rw, console=) into GRUB's config. On device you then boot the disk
+# with NO -kernel/-initrd/-append at all - nothing for UTM to mangle.
 RAW="${WORK}/guest.raw"
 truncate -s "${SIZE}" "${RAW}"
-mkfs.ext4 -d "${WORK}/rootfs" -F "${RAW}"
+# MBR (msdos) table, one bootable ext4 partition starting at 1MiB (leaves the
+# post-MBR gap GRUB needs to embed core.img).
+parted -s "${RAW}" mklabel msdos
+parted -s "${RAW}" mkpart primary ext4 1MiB 100%
+parted -s "${RAW}" set 1 boot on
+
+LOOP="$(sudo losetup --show -fP "${RAW}")"    # -P exposes ${LOOP}p1
+sudo mkfs.ext4 -F "${LOOP}p1"
+MNT="${WORK}/mnt"
+mkdir -p "${MNT}"
+sudo mount "${LOOP}p1" "${MNT}"
+sudo cp -a "${WORK}/rootfs/." "${MNT}/"
+
+# fstab by UUID so systemd mounts / read-write and doesn't drop to emergency.
+ROOT_UUID="$(sudo blkid -s UUID -o value "${LOOP}p1")"
+echo "UUID=${ROOT_UUID} / ext4 errors=remount-ro 0 1" | sudo tee "${MNT}/etc/fstab" >/dev/null
+
+# Bind host /dev,/proc,/sys so grub-install/update-grub work inside the chroot.
+for d in dev dev/pts proc sys; do sudo mount --bind "/$d" "${MNT}/$d"; done
+# Bake the whole kernel command line here (this is the part UTM used to split).
+# Two consoles: tty0 for the on-device graphical display, ttyS0 for CI's serial
+# boot watcher. GRUB itself also talks to both so it works headless in CI.
+sudo tee "${MNT}/etc/default/grub" >/dev/null <<GRUBCFG
+GRUB_TIMEOUT=1
+GRUB_CMDLINE_LINUX="root=UUID=${ROOT_UUID} rw console=tty0 console=ttyS0"
+GRUB_TERMINAL="console serial"
+GRUB_DISABLE_OS_PROBER=true
+GRUBCFG
+sudo chroot "${MNT}" grub-install --target=i386-pc --boot-directory=/boot "${LOOP}"
+sudo chroot "${MNT}" update-grub
+
+for d in sys proc dev/pts dev; do sudo umount "${MNT}/$d"; done
+sudo umount "${MNT}"
+sudo losetup -d "${LOOP}"
+
 qemu-img convert -f raw -O qcow2 "${RAW}" "${OUT}"
 # Built under sudo, so the image is root-owned; hand it back to the invoking user
 # (SUDO_UID set when run via sudo) so qemu/UTM/CI can open it without root.
 sudo chown "${SUDO_UID:-$(id -u)}:${SUDO_GID:-$(id -g)}" "${OUT}"
 
-echo "==> ${OUT} ready ($(du -h "${OUT}" | cut -f1)); kernel+initrd in ${ROOT}/vm/"
+echo "==> ${OUT} ready ($(du -h "${OUT}" | cut -f1)) - SELF-BOOTING (no -kernel needed)"
+echo "    In UTM: attach ONLY this disk (VirtIO). Delete kernel, initrd, and every"
+echo "    Additional Argument. Just press Play."
 echo "    Boot (desktop, with GPU):"
-echo "      qemu-system-x86_64 -accel tcg -m 4096 -kernel vm/vmlinuz -initrd vm/initrd.img \\"
-echo "        -append 'root=/dev/vda rw console=ttyS0' \\"
+echo "      qemu-system-x86_64 -accel tcg -m 4096 \\"
 echo "        -drive if=virtio,file=${OUT##*/},format=qcow2 -device virtio-gpu-gl-pci"
 echo "    Inside the guest, verify GPU accel with:  glxinfo | grep -i renderer"
 echo "    Expect 'virgl'; 'llvmpipe' means software rendering (unplayable)."

@@ -27,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 qemu-utils debootstrap e2fsprogs
+            qemu-system-x86 qemu-utils debootstrap e2fsprogs parted util-linux
           qemu-system-x86_64 --version
           df -h /
 
@@ -40,15 +40,16 @@ jobs:
           ls -lh vm/gmod-guest.qcow2 vm/vmlinuz vm/initrd.img
           qemu-img info vm/gmod-guest.qcow2
 
-      - name: Boot test under TCG (watch for GUEST_BOOT_OK)
+      - name: Boot test under TCG (self-booting disk, watch for GUEST_BOOT_OK)
         run: |
           set -x
+          # No -kernel/-initrd/-append: the disk boots itself via GRUB, exactly
+          # like it will on the phone in UTM. Serial goes to boot.log; GRUB and
+          # the kernel are configured for console=ttyS0 so we can watch it.
           timeout 600 qemu-system-x86_64 \
             -accel tcg -m 3072 -smp 2 \
-            -kernel vm/vmlinuz -initrd vm/initrd.img \
-            -append "root=/dev/vda rw console=ttyS0 panic=-1" \
             -drive if=virtio,file=vm/gmod-guest.qcow2,format=qcow2 \
-            -nographic -serial file:boot.log -monitor none &
+            -display none -serial file:boot.log -monitor none &
           QPID=$!
           ok=0
           for i in $(seq 1 120); do
