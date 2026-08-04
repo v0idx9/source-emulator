@@ -1,0 +1,10 @@
+# Build output
+/build/
+# Fetched third-party sources (populated by scripts/fetch-*.sh)
+/third_party/
+# macOS
+.DS_Store
+# Game content — never commit copyrighted binaries/assets
+/game/
+*.tipa
+*.ipa
