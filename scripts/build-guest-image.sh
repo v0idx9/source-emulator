@@ -20,7 +20,18 @@ OUT="${ROOT}/vm/gmod-guest.qcow2"
 SIZE="${GUEST_SIZE:-20G}"
 SUITE="${GUEST_SUITE:-bookworm}"
 WORK="$(mktemp -d)"
-trap 'rm -rf "${WORK}"' EXIT
+MNT=""; LOOP=""
+# Unmount the chroot bind-mounts (and loop dev) before wiping WORK, so a failure
+# mid-build doesn't leave /proc etc. mounted and make `rm -rf` choke on them.
+cleanup() {
+	for d in sys proc dev/pts dev; do
+		mountpoint -q "${MNT}/$d" 2>/dev/null && sudo umount "${MNT}/$d" 2>/dev/null || true
+	done
+	[ -n "${MNT}" ] && mountpoint -q "${MNT}" 2>/dev/null && sudo umount "${MNT}" 2>/dev/null || true
+	[ -n "${LOOP}" ] && sudo losetup -d "${LOOP}" 2>/dev/null || true
+	sudo rm -rf "${WORK}" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing tool: $1" >&2; exit 1; }; }
 need qemu-img
@@ -30,7 +41,7 @@ echo "==> base rootfs (${SUITE}, x86-64)"
 # linux-image-amd64 gives a bootable kernel+initrd; without it QEMU has nothing
 # to boot. mesa virgl driver is libgl1-mesa-dri (provides virtio_gpu/virgl DRI).
 sudo debootstrap --arch=amd64 --variant=minbase \
-	--include=linux-image-amd64,systemd-sysv,ca-certificates,curl,libgl1-mesa-dri,mesa-utils,libc6-i386,lib32gcc-s1,xserver-xorg-core,xinit,openbox,grub-pc-bin,grub-common \
+	--include=linux-image-amd64,systemd-sysv,ca-certificates,curl,libgl1-mesa-dri,mesa-utils,libc6-i386,lib32gcc-s1,xserver-xorg-core,xinit,openbox,grub-pc-bin,grub-common,grub2-common \
 	"${SUITE}" "${WORK}/rootfs" http://deb.debian.org/debian
 
 # Root password + serial console so the image is loginable and CI can watch boot.
