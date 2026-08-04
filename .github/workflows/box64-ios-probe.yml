@@ -1,0 +1,46 @@
+name: box64 iOS cross-compile probe
+
+# Stage-1 reconnaissance: on a real macOS host, fetch box64 and attempt the iOS
+# cross-compile. It is EXPECTED to fail at the CMake/compile wall. The job never
+# fails the workflow on that account - it uploads the logs so the Darwin/iOS
+# port blockers (see PORTING-box64.md) can be triaged from real toolchain
+# output rather than inference.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/build-box64-ios.sh'
+      - 'scripts/fetch-box64.sh'
+      - '.github/workflows/box64-ios-probe.yml'
+
+jobs:
+  probe:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-path
+          cmake --version || brew install cmake
+
+      - name: Fetch box64
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/fetch-box64.sh
+
+      - name: Attempt iOS cross-compile (expected to surface blockers)
+        run: ./scripts/build-box64-ios.sh
+
+      - name: Upload blocker logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: box64-ios-configure-log
+          if-no-files-found: warn
+          path: |
+            build/box64-ios/configure.log
+            build/box64-ios/build.log

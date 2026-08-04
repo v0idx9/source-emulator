@@ -8,12 +8,15 @@ time) and it is the only way to keep this honest.
 ## Stage 0 — foundation *(current)*
 
 - [x] Repo, architecture, decision recorded (Linux ELF + box64 + GL→Metal).
-- [ ] `scripts/fetch-box64.sh` clones box64 at a pinned commit.
-- [ ] `scripts/build-box64-ios.sh` attempts an iOS arm64 cross-compile.
+- [x] `scripts/fetch-box64.sh` clones box64 at a pinned commit.
+- [x] `scripts/build-box64-ios.sh` attempts an iOS arm64 cross-compile.
+- [x] **Port blockers enumerated from source** → [`PORTING-box64.md`](PORTING-box64.md).
 
-**Exit criteria:** the cross-compile *attempt* runs and produces a concrete list
-of what breaks porting box64 to Darwin/iOS. We are not expecting it to succeed —
-we are expecting it to define stage 1.
+**Exit criteria: met.** The blocker list exists and is evidence-based
+(`file:line` into box64). Key result: box64 assumes a **Linux host kernel**
+(syscall passthrough, `x64syscall.c:444-450`), so the port is a syscall-layer
+**rewrite** plus a **W^X dynarec** change — not a few primitives. Scale is now
+known *before* spending Stage-1 effort, which is the point of Stage 0.
 
 ## Stage 1 — box64 runs *anything* on iOS
 
