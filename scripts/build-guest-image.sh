@@ -85,7 +85,7 @@ sudo chroot "${WORK}/rootfs" /usr/local/sbin/provision.sh
 echo "==> extract kernel + initrd for direct (-kernel/-initrd) boot"
 sudo cp "${WORK}"/rootfs/boot/vmlinuz-* "${ROOT}/vm/vmlinuz"
 sudo cp "${WORK}"/rootfs/boot/initrd.img-* "${ROOT}/vm/initrd.img"
-sudo chown "$(id -u):$(id -g)" "${ROOT}/vm/vmlinuz" "${ROOT}/vm/initrd.img"
+sudo chown "${SUDO_UID:-$(id -u)}:${SUDO_GID:-$(id -g)}" "${ROOT}/vm/vmlinuz" "${ROOT}/vm/initrd.img"
 
 echo "==> pack rootfs into a qcow2"
 # Single ext4 rootfs; booted via -kernel/-initrd with root=/dev/vda (no bootloader
@@ -94,6 +94,9 @@ RAW="${WORK}/guest.raw"
 truncate -s "${SIZE}" "${RAW}"
 mkfs.ext4 -d "${WORK}/rootfs" -F "${RAW}"
 qemu-img convert -f raw -O qcow2 "${RAW}" "${OUT}"
+# Built under sudo, so the image is root-owned; hand it back to the invoking user
+# (SUDO_UID set when run via sudo) so qemu/UTM/CI can open it without root.
+sudo chown "${SUDO_UID:-$(id -u)}:${SUDO_GID:-$(id -g)}" "${OUT}"
 
 echo "==> ${OUT} ready ($(du -h "${OUT}" | cut -f1)); kernel+initrd in ${ROOT}/vm/"
 echo "    Boot (desktop, with GPU):"
