@@ -1,0 +1,76 @@
+name: guest image build + TCG boot test
+
+# Executes the x86-64 Linux guest build on a Linux runner (no Mac/desktop
+# needed) and boots it under QEMU TCG to prove the image is valid. TCG needs no
+# KVM, so it runs on stock GitHub runners.
+#
+# Scope note: the runner is headless with no GPU, so this proves the guest
+# *boots* under x86-64 emulation. It does NOT measure virgl/GPU performance -
+# that needs a GPU host or the device (prebuilt UTM via TrollStore). The GPU
+# path is validated separately; see ROADMAP Stage 2/4.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/build-guest-image.sh'
+      - '.github/workflows/guest-build.yml'
+
+jobs:
+  build-and-boot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU + debootstrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-utils debootstrap e2fsprogs
+          qemu-system-x86_64 --version
+          df -h /
+
+      - name: Build guest image
+        env:
+          GUEST_SIZE: "12G"     # virtual; qcow2 only stores used blocks
+        run: |
+          chmod +x scripts/*.sh
+          sudo -E ./scripts/build-guest-image.sh
+          ls -lh vm/gmod-guest.qcow2 vm/vmlinuz vm/initrd.img
+          qemu-img info vm/gmod-guest.qcow2
+
+      - name: Boot test under TCG (watch for GUEST_BOOT_OK)
+        run: |
+          set -x
+          timeout 600 qemu-system-x86_64 \
+            -accel tcg -m 3072 -smp 2 \
+            -kernel vm/vmlinuz -initrd vm/initrd.img \
+            -append "root=/dev/vda rw console=ttyS0 panic=-1" \
+            -drive if=virtio,file=vm/gmod-guest.qcow2,format=qcow2 \
+            -nographic -serial file:boot.log -monitor none &
+          QPID=$!
+          ok=0
+          for i in $(seq 1 120); do
+            if grep -q GUEST_BOOT_OK boot.log 2>/dev/null; then ok=1; break; fi
+            if ! kill -0 "$QPID" 2>/dev/null; then break; fi
+            sleep 5
+          done
+          kill "$QPID" 2>/dev/null || true
+          echo "----- boot.log (tail) -----"; tail -40 boot.log || true
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::guest did not reach GUEST_BOOT_OK under TCG"; exit 1
+          fi
+          echo "Guest booted under x86-64 TCG."
+
+      - name: Upload guest image + boot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gmod-guest-image
+          if-no-files-found: warn
+          path: |
+            vm/gmod-guest.qcow2
+            vm/vmlinuz
+            vm/initrd.img
+            boot.log
